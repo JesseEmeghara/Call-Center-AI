@@ -1,32 +1,34 @@
-from fastapi import FastAPI, Request, HTTPException
+# app.py
+
+import os
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, Response
+from fastapi.responses import Response, JSONResponse
 from pydantic import BaseModel, Field
 from twilio.rest import Client
-import os
 
 # ── CONFIG ────────────────────────────────────────────────────────────────
 TWILIO_SID   = os.getenv("TWILIO_ACCOUNT_SID")
 TWILIO_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
 API_KEY      = os.getenv("API_KEY")
-FROM_NUMBER  = os.getenv("FROM_NUMBER")
-API_BASE     = os.getenv("API_BASE")
+FROM_NUMBER  = os.getenv("FROM_NUMBER")   # e.g. "+18338790587"
+API_BASE     = os.getenv("API_BASE")      # e.g. "https://assistant.emeghara.tech"
 
 if not all([TWILIO_SID, TWILIO_TOKEN, API_KEY, FROM_NUMBER, API_BASE]):
     raise RuntimeError("One or more required env vars missing")
 
-# ── APP & CLIENT ──────────────────────────────────────────────────────────
+# ── APP & CLIENT SETUP ─────────────────────────────────────────────────────
 app = FastAPI()
 twilio_client = Client(TWILIO_SID, TWILIO_TOKEN)
 
 # ── CORS ───────────────────────────────────────────────────────────────────
+# Allow your UI origins (www & naked), adjust or add more as needed:
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
-        "https://assistant.emeghara.tech",
         "https://www.emeghara.tech",
         "https://emeghara.tech",
-        # "*"  # ← you can use this during dev/testing, but lock down in prod
+        "https://assistant.emeghara.tech"
     ],
     allow_methods=["*"],
     allow_headers=["*"],
@@ -35,10 +37,13 @@ app.add_middleware(
 # ── API-KEY VERIFICATION ───────────────────────────────────────────────────
 @app.middleware("http")
 async def verify_api_key(request: Request, call_next):
+    # exempt health and TwiML
     if request.url.path in ("/health", "/twiml"):
         return await call_next(request)
+
     if request.headers.get("x-api-key") != API_KEY:
         return JSONResponse({"detail": "Invalid API Key"}, status_code=401)
+
     return await call_next(request)
 
 # ── MODELS ─────────────────────────────────────────────────────────────────
@@ -49,16 +54,17 @@ class CallStartPayload(BaseModel):
 class CallStopPayload(BaseModel):
     callConnectionId: str
 
-# ── HEALTH ──────────────────────────────────────────────────────────────────
+# ── HEALTH CHECK ────────────────────────────────────────────────────────────
 @app.get("/health")
 async def health():
     return {"status": "ok"}
 
-# ── START CALL ──────────────────────────────────────────────────────────────
+# ── START A CALL ───────────────────────────────────────────────────────────
 @app.post("/call/start")
 async def start_call(payload: CallStartPayload):
     to_number   = payload.to
     from_number = payload.from_ or FROM_NUMBER
+
     try:
         call = twilio_client.calls.create(
             to=to_number,
@@ -69,7 +75,7 @@ async def start_call(payload: CallStartPayload):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-# ── STOP CALL ───────────────────────────────────────────────────────────────
+# ── STOP (HANG UP) A CALL ─────────────────────────────────────────────────
 @app.post("/call/stop")
 async def stop_call(payload: CallStopPayload):
     try:
@@ -78,7 +84,7 @@ async def stop_call(payload: CallStopPayload):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-# ── TWIML ───────────────────────────────────────────────────────────────────
+# ── TWIML ENDPOINT ────────────────────────────────────────────────────────
 @app.post("/twiml")
 async def twiml():
     xml = """
@@ -89,11 +95,3 @@ async def twiml():
 </Response>
 """
     return Response(content=xml, media_type="text/xml")
-
-# ── (OPTIONAL) STATIC UI ─────────────────────────────────────────────────────
-from fastapi.staticfiles import StaticFiles
-app.mount(
-    "/",
-    StaticFiles(directory="public_html/assistant", html=True),
-    name="static"
-)
