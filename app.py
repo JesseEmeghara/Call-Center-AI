@@ -6,7 +6,6 @@ import base64
 from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response, JSONResponse
-from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from twilio.rest import Client
 
@@ -16,13 +15,18 @@ TWILIO_TOKEN    = os.getenv("TWILIO_AUTH_TOKEN")
 API_KEY         = os.getenv("API_KEY")
 FROM_NUMBER     = os.getenv("FROM_NUMBER")      # e.g. "+18338790587"
 API_BASE        = os.getenv("API_BASE")         # e.g. "https://assistant.emeghara.tech"
-LEADS_TO        = os.getenv("LEADS_TO")         # comma-separated emails
+LEADS_TO        = os.getenv("LEADS_TO")         # comma-sep emails
 SMTP_HOST       = os.getenv("SMTP_HOST")
 SMTP_PORT       = int(os.getenv("SMTP_PORT", 587))
 SMTP_USER       = os.getenv("SMTP_USER")
 SMTP_PASS       = os.getenv("SMTP_PASS")
 
-if not all([TWILIO_SID, TWILIO_TOKEN, API_KEY, FROM_NUMBER, API_BASE]):
+required = [
+    TWILIO_SID, TWILIO_TOKEN,
+    API_KEY, FROM_NUMBER, API_BASE,
+    LEADS_TO, SMTP_HOST, SMTP_USER, SMTP_PASS
+]
+if not all(required):
     raise RuntimeError("One or more required env vars missing")
 
 # ── APP & CLIENT SETUP ─────────────────────────────────────────────────────
@@ -33,16 +37,17 @@ twilio_client = Client(TWILIO_SID, TWILIO_TOKEN)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
-      "https://assistant.emeghara.tech",
-      "https://www.emeghara.tech",
+        "https://assistant.emeghara.tech",
+        "https://www.emeghara.tech",
     ],
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# ── VERIFY API-KEY ─────────────────────────────────────────────────────────
+# ── VERIFY API KEY ──────────────────────────────────────────────────────────
 @app.middleware("http")
 async def verify_api_key(request: Request, call_next):
+    # allow these without a key
     if request.url.path in ("/health", "/twiml", "/incoming", "/stream"):
         return await call_next(request)
     key = request.headers.get("x-api-key")
@@ -50,7 +55,7 @@ async def verify_api_key(request: Request, call_next):
         return JSONResponse({"detail": "Invalid API Key"}, status_code=401)
     return await call_next(request)
 
-# ── PAYLOAD MODELS ─────────────────────────────────────────────────────────
+# ── MODELS ─────────────────────────────────────────────────────────────────
 class CallStartPayload(BaseModel):
     to: str
     from_: str | None = Field(None, alias="from")
@@ -90,55 +95,42 @@ async def stop_call(payload: CallStopPayload):
 # ── INCOMING TWIML ───────────────────────────────────────────────────────────
 @app.post("/incoming")
 async def incoming():
-    # Kick off a Media Stream into our /stream WS
     twiml = f"""
     <Response>
       <Start>
         <Stream url="wss://{os.getenv('HOSTNAME')}/stream"/>
       </Start>
-      <!-- silence until WebSocket wire-up -->
+      <!-- silence until WS connects -->
       <Pause length="60"/>
       <Hangup/>
     </Response>
     """
     return Response(content=twiml, media_type="text/xml")
 
-# ── MEDIA STREAM WS ─────────────────────────────────────────────────────────
+# ── MEDIA STREAM WEBSOCKET ─────────────────────────────────────────────────
 @app.websocket("/stream")
 async def media_stream(ws: WebSocket):
     await ws.accept()
-    chat_history = []  # will hold {"role":...,"content":...}
+    chat_history = []  # [{"role":"user","content":...},...]
     try:
         while True:
-            frame = await ws.receive_text()
-            msg = json.loads(frame)
-
+            msg = json.loads(await ws.receive_text())
             if msg.get("event") == "media":
-                payload_b64 = msg["media"]["payload"]
-                audio_bytes = base64.b64decode(payload_b64)
-                # TODO: buffer & send to Whisper → transcribe
+                b64 = msg["media"]["payload"]
+                audio = base64.b64decode(b64)
+                # TODO: buffer audio → Whisper → transcript
                 # chat_history.append({"role":"user","content": transcript})
-                # TODO: call OpenAI ChatCompletion
-                # reply = ...
-                # TODO: synthesize reply via TTS → reply_bytes
-                # reply_b64 = base64.b64encode(reply_bytes).decode()
+                # TODO: GPT multi-turn chat → reply_text
+                # chat_history.append({"role":"assistant","content": reply_text})
+                # TODO: TTS(reply_text) → mp3_bytes → reply_b64
                 # await ws.send_text(json.dumps({
                 #   "event":"media",
                 #   "media":{"payload": reply_b64}
                 # }))
-                pass
-
-            if msg.get("event") == "stop":
+            elif msg.get("event") == "stop":
                 break
 
     except WebSocketDisconnect:
         pass
     finally:
         await ws.close()
-
-# ── OPTIONAL: SERVE UI ───────────────────────────────────────────────────────
-app.mount(
-    "/", 
-    StaticFiles(directory="public_html/assistant", html=True),
-    name="static",
-)
