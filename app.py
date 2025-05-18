@@ -4,27 +4,27 @@ import os
 from fastapi import FastAPI, HTTPException, Request, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response, JSONResponse
-from pydantic import BaseModel, Field
+from fastapi.staticfiles import StaticFiles
 from twilio.rest import Client
+from twilio.twiml.voice_response import VoiceResponse, Gather
 import smtplib
-from email.message import EmailMessage
+from email.mime.text import MIMEText
 
 # ── CONFIG ────────────────────────────────────────────────────────────────
 TWILIO_SID      = os.getenv("TWILIO_ACCOUNT_SID")
 TWILIO_TOKEN    = os.getenv("TWILIO_AUTH_TOKEN")
 API_KEY         = os.getenv("API_KEY")
-FROM_NUMBER     = os.getenv("FROM_NUMBER")   # e.g. "+18338790587"
-API_BASE        = os.getenv("API_BASE")      # e.g. "https://assistant.emeghara.tech"
+FROM_NUMBER     = os.getenv("FROM_NUMBER")     # e.g. "+18338790587"
+API_BASE        = os.getenv("API_BASE")        # e.g. "https://assistant.emeghara.tech"
 
-# Hostinger SMTP
-SMTP_HOST       = os.getenv("SMTP_HOST")     # smtp.hostinger.com
-SMTP_PORT       = int(os.getenv("SMTP_PORT", "587"))
-SMTP_USER       = os.getenv("SMTP_USER")     # info@emeghara.tech
+SMTP_HOST       = os.getenv("SMTP_HOST")       # smtp.hostinger.com
+SMTP_PORT       = int(os.getenv("SMTP_PORT", 587))
+SMTP_USER       = os.getenv("SMTP_USER")       # info@emeghara.tech
 SMTP_PASS       = os.getenv("SMTP_PASS")
-LEADS_TO        = os.getenv("LEADS_TO")      # comma-separated
+LEADS_TO        = os.getenv("LEADS_TO")        # comma-separated emails
 
 if not all([TWILIO_SID, TWILIO_TOKEN, API_KEY, FROM_NUMBER, API_BASE,
-            SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS, LEADS_TO]):
+            SMTP_HOST, SMTP_USER, SMTP_PASS, LEADS_TO]):
     raise RuntimeError("One or more required env vars missing")
 
 # ── APP & CLIENT SETUP ─────────────────────────────────────────────────────
@@ -35,18 +35,18 @@ twilio_client = Client(TWILIO_SID, TWILIO_TOKEN)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
-      "https://assistant.emeghara.tech",  # your API host
-      "https://www.emeghara.tech"         # your UI host
+        "https://assistant.emeghara.tech",
+        "https://www.emeghara.tech"
     ],
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# ── API-KEY VERIFICATION ────────────────────────────────────────────────────
+# ── API-KEY VERIFICATION ───────────────────────────────────────────────────
 @app.middleware("http")
 async def verify_api_key(request: Request, call_next):
-    # allow health, twiml & incoming without x-api-key
-    if request.url.path in ("/health", "/twiml", "/incoming"):
+    # allow these public endpoints
+    if request.url.path in ("/health", "/incoming", "/handle-lead"):
         return await call_next(request)
 
     key = request.headers.get("x-api-key")
@@ -55,7 +55,21 @@ async def verify_api_key(request: Request, call_next):
 
     return await call_next(request)
 
-# ── MODELS ─────────────────────────────────────────────────────────────────
+# ── STATIC UI (OPTIONAL) ──────────────────────────────────────────────────
+app.mount(
+    "/",
+    StaticFiles(directory="public_html/assistant", html=True),
+    name="static",
+)
+
+# ── HEALTH CHECK ───────────────────────────────────────────────────────────
+@app.get("/health")
+async def health():
+    return {"status": "ok"}
+
+# ── OUTBOUND CALLS FOR “CALL ME” BUTTON ────────────────────────────────────
+from pydantic import BaseModel, Field
+
 class CallStartPayload(BaseModel):
     to: str
     from_: str | None = Field(None, alias="from")
@@ -63,12 +77,6 @@ class CallStartPayload(BaseModel):
 class CallStopPayload(BaseModel):
     callConnectionId: str
 
-# ── HEALTH CHECK ────────────────────────────────────────────────────────────
-@app.get("/health")
-async def health():
-    return {"status": "ok"}
-
-# ── START A CALL ───────────────────────────────────────────────────────────
 @app.post("/call/start")
 async def start_call(payload: CallStartPayload):
     to_number   = payload.to
@@ -78,13 +86,12 @@ async def start_call(payload: CallStartPayload):
         call = twilio_client.calls.create(
             to=to_number,
             from_=from_number,
-            url=f"{API_BASE}/twiml"
+            url=f"{API_BASE}/incoming"
         )
         return {"callConnectionId": call.sid}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-# ── STOP (HANG UP) A CALL ──────────────────────────────────────────────────
 @app.post("/call/stop")
 async def stop_call(payload: CallStopPayload):
     try:
@@ -93,38 +100,47 @@ async def stop_call(payload: CallStopPayload):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-# ── INCOMING CALL WEBHOOK ──────────────────────────────────────────────────
+# ── INCOMING WEBHOOK: GATHER THE LEAD’S NAME ───────────────────────────────
 @app.post("/incoming")
-async def incoming_call(
-    From: str = Form(...),
-    CallSid: str = Form(...),
-):
-    """
-    Handle an inbound call:
-    1) Twilio will POST caller → we gather name/email via <Gather> and then
-       Twilio will POST digits to /incoming again with the collected data.
-    2) Once we have everything, send an email via SMTP.
-    """
-    # Simplest: just respond with TwiML to gather digits or speak
-    # (For brevity, this endpoint needs TwiML logic to collect name/email via keypad or speech.)
-    xml = f"""
-<Response>
-  <Say voice="alice">Thanks for calling! Please leave your name, then press pound.</Say>
-  <Record maxLength="20" finishOnKey="#"/>
-  <Say voice="alice">Goodbye.</Say>
-  <Hangup/>
-</Response>
-"""
-    return Response(content=xml, media_type="text/xml")
+async def incoming():
+    # ask caller to say their name, then press #
+    resp = VoiceResponse()
+    gather = Gather(input="speech", action="/handle-lead", method="POST", finishOnKey="#")
+    gather.say("Hello! Please say your name after the tone, then press the pound key.")
+    resp.append(gather)
+    # if they never respond, hang up
+    resp.say("We didn't receive any input. Goodbye.")
+    resp.hangup()
+    return Response(content=str(resp), media_type="text/xml")
 
-# ── TWIML FOR CALLBACK ──────────────────────────────────────────────────────
-@app.post("/twiml")
-async def twiml():
-    xml = """
-<Response>
-  <Say voice="alice">Hello! This is Call-Center AI calling you back.</Say>
-  <Pause length="30"/>
-  <Hangup/>
-</Response>
-"""
-    return Response(content=xml, media_type="text/xml")
+# ── HANDLE-LEAD: SEND EMAIL & HANG UP ──────────────────────────────────────
+@app.post("/handle-lead")
+async def handle_lead(speechResult: str = Form(...), From: str = Form(...)):
+    # speechResult → the name they spoke
+    # From → the caller’s phone number
+    try:
+        msg = MIMEText(f"""
+        <p><strong>Name:</strong> {speechResult}</p>
+        <p><strong>Phone:</strong> {From}</p>
+        """, "html")
+        msg["Subject"] = "New Lead from Call-Center AI"
+        msg["From"]    = SMTP_USER
+        msg["To"]      = LEADS_TO
+
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as smtp:
+            smtp.starttls()
+            smtp.login(SMTP_USER, SMTP_PASS)
+            smtp.sendmail(SMTP_USER, LEADS_TO.split(","), msg.as_string())
+
+    except Exception as e:
+        # on error, tell them and hang up
+        resp = VoiceResponse()
+        resp.say("Sorry, we encountered an error saving your lead. Goodbye.")
+        resp.hangup()
+        return Response(content=str(resp), media_type="text/xml")
+
+    # success: thank them
+    resp = VoiceResponse()
+    resp.say("Thank you! Your information has been received. Goodbye.")
+    resp.hangup()
+    return Response(content=str(resp), media_type="text/xml")
