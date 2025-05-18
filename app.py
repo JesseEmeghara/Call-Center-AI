@@ -8,23 +8,26 @@ from pydantic import BaseModel, Field
 from twilio.rest import Client
 
 # ── CONFIG ────────────────────────────────────────────────────────────────
-TWILIO_SID      = os.getenv("TWILIO_ACCOUNT_SID")
-TWILIO_TOKEN    = os.getenv("TWILIO_AUTH_TOKEN")
-API_KEY         = os.getenv("API_KEY")
-FROM_NUMBER     = os.getenv("FROM_NUMBER")
-API_BASE        = os.getenv("API_BASE")
+TWILIO_SID   = os.getenv("TWILIO_ACCOUNT_SID")
+TWILIO_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
+API_KEY      = os.getenv("API_KEY")
+FROM_NUMBER  = os.getenv("FROM_NUMBER")   # "+18338790587"
+API_BASE     = os.getenv("API_BASE")      # "https://assistant.emeghara.tech"
 
 if not all([TWILIO_SID, TWILIO_TOKEN, API_KEY, FROM_NUMBER, API_BASE]):
     raise RuntimeError("One or more required env vars missing")
 
-# ── SETUP ──────────────────────────────────────────────────────────────────
+# ── APP & CLIENT SETUP ─────────────────────────────────────────────────────
 app = FastAPI()
 twilio_client = Client(TWILIO_SID, TWILIO_TOKEN)
 
-# ── TEMPORARY CORS (allow everything)───────────────────────────────────────
+# ── CORS ───────────────────────────────────────────────────────────────────
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],           # ← allow all origins while debugging
+    allow_origins=[
+      "https://assistant.emeghara.tech",  # your API domain
+      "https://www.emeghara.tech"         # your static UI domain
+    ],
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -34,8 +37,9 @@ app.add_middleware(
 async def verify_api_key(request: Request, call_next):
     if request.url.path in ("/health", "/twiml"):
         return await call_next(request)
-    if request.headers.get("x-api-key") != API_KEY:
-        return JSONResponse({"detail":"Invalid API Key"}, status_code=401)
+    key = request.headers.get("x-api-key")
+    if key != API_KEY:
+        return JSONResponse({"detail": "Invalid API Key"}, status_code=401)
     return await call_next(request)
 
 # ── MODELS ─────────────────────────────────────────────────────────────────
@@ -51,29 +55,38 @@ class CallStopPayload(BaseModel):
 async def health():
     return {"status": "ok"}
 
-# ── START CALL ──────────────────────────────────────────────────────────────
+# ── START A CALL ───────────────────────────────────────────────────────────
 @app.post("/call/start")
 async def start_call(payload: CallStartPayload):
+    to_number   = payload.to
+    from_number = payload.from_ or FROM_NUMBER
     try:
         call = twilio_client.calls.create(
-            to=payload.to,
-            from_=payload.from_ or FROM_NUMBER,
+            to=to_number,
+            from_=from_number,
             url=f"{API_BASE}/twiml"
         )
         return {"callConnectionId": call.sid}
     except Exception as e:
-        raise HTTPException(500, str(e))
+        raise HTTPException(status_code=500, detail=str(e))
 
-# ── STOP CALL ───────────────────────────────────────────────────────────────
+# ── STOP (HANG UP) A CALL ─────────────────────────────────────────────────
 @app.post("/call/stop")
 async def stop_call(payload: CallStopPayload):
     try:
         twilio_client.calls(payload.callConnectionId).update(status="completed")
-        return {"status":"completed"}
+        return {"status": "completed"}
     except Exception as e:
-        raise HTTPException(500, str(e))
+        raise HTTPException(status_code=500, detail=str(e))
 
-# ── TWIML ────────────────────────────────────────────────────────────────────
+# ── TRANSCRIPT STUB ────────────────────────────────────────────────────────
+# (so your UI's pollTranscript() won't 404)
+@app.get("/call/transcript")
+async def transcript(callConnectionId: str):
+    # TODO: wire up real transcript logic
+    return {"transcript": []}
+
+# ── TWIML ENDPOINT ──────────────────────────────────────────────────────────
 @app.post("/twiml")
 async def twiml():
     xml = """
@@ -83,4 +96,4 @@ async def twiml():
   <Hangup/>
 </Response>
 """
-    return Response(xml, media_type="text/xml")
+    return Response(content=xml, media_type="text/xml")
