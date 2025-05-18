@@ -17,28 +17,26 @@ API_BASE     = os.getenv("API_BASE")      # e.g. "https://assistant.emeghara.tec
 if not all([TWILIO_SID, TWILIO_TOKEN, API_KEY, FROM_NUMBER, API_BASE]):
     raise RuntimeError("One or more required env vars missing")
 
-# ── APP & CLIENT SETUP ─────────────────────────────────────────────────────
+# ── APP & CLIENT ───────────────────────────────────────────────────────────
 app = FastAPI()
 twilio_client = Client(TWILIO_SID, TWILIO_TOKEN)
 
 # ── CORS ───────────────────────────────────────────────────────────────────
-# Allow your UI origins (www & naked), adjust or add more as needed:
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
         "https://www.emeghara.tech",
         "https://emeghara.tech",
-        "https://assistant.emeghara.tech"
     ],
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# ── API-KEY VERIFICATION ───────────────────────────────────────────────────
+# ── API-KEY GUARD (exempt OPTIONS & a few endpoints) ────────────────────────
 @app.middleware("http")
 async def verify_api_key(request: Request, call_next):
-    # exempt health and TwiML
-    if request.url.path in ("/health", "/twiml"):
+    # Allow preflight and health/TwiML without key
+    if request.method == "OPTIONS" or request.url.path in ("/health", "/twiml"):
         return await call_next(request)
 
     if request.headers.get("x-api-key") != API_KEY:
@@ -84,7 +82,7 @@ async def stop_call(payload: CallStopPayload):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-# ── TWIML ENDPOINT ────────────────────────────────────────────────────────
+# ── TWIML ENDPOINT ──────────────────────────────────────────────────────────
 @app.post("/twiml")
 async def twiml():
     xml = """
