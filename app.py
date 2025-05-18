@@ -1,146 +1,160 @@
 # app.py
 
 import os
-from fastapi import FastAPI, HTTPException, Request, Form
+import base64
+from fastapi import FastAPI, HTTPException, Request, WebSocket
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import Response, JSONResponse
-from fastapi.staticfiles import StaticFiles
+from fastapi.responses import JSONResponse, Response
+from pydantic import BaseModel, Field
 from twilio.rest import Client
-from twilio.twiml.voice_response import VoiceResponse, Gather
-import smtplib
-from email.mime.text import MIMEText
+import openai  # for chat
+# import your STT/TTS helpers here
+# from your_module import stt_recognize, tts_synthesize
 
 # ── CONFIG ────────────────────────────────────────────────────────────────
 TWILIO_SID      = os.getenv("TWILIO_ACCOUNT_SID")
 TWILIO_TOKEN    = os.getenv("TWILIO_AUTH_TOKEN")
 API_KEY         = os.getenv("API_KEY")
-FROM_NUMBER     = os.getenv("FROM_NUMBER")     # e.g. "+18338790587"
-API_BASE        = os.getenv("API_BASE")        # e.g. "https://assistant.emeghara.tech"
+FROM_NUMBER     = os.getenv("FROM_NUMBER")    # "+18338790587"
+API_BASE        = os.getenv("API_BASE")       # "https://assistant.emeghara.tech"
+OPENAI_API_KEY  = os.getenv("OPENAI_API_KEY")
+openai.api_key  = OPENAI_API_KEY
 
-SMTP_HOST       = os.getenv("SMTP_HOST")       # smtp.hostinger.com
-SMTP_PORT       = int(os.getenv("SMTP_PORT", 587))
-SMTP_USER       = os.getenv("SMTP_USER")       # info@emeghara.tech
-SMTP_PASS       = os.getenv("SMTP_PASS")
-LEADS_TO        = os.getenv("LEADS_TO")        # comma-separated emails
+if not all([TWILIO_SID, TWILIO_TOKEN, API_KEY, FROM_NUMBER, API_BASE, OPENAI_API_KEY]):
+    raise RuntimeError("Missing one or more required env vars")
 
-if not all([TWILIO_SID, TWILIO_TOKEN, API_KEY, FROM_NUMBER, API_BASE,
-            SMTP_HOST, SMTP_USER, SMTP_PASS, LEADS_TO]):
-    raise RuntimeError("One or more required env vars missing")
-
-# ── APP & CLIENT SETUP ─────────────────────────────────────────────────────
+# ── FASTAPI + CLIENTS ─────────────────────────────────────────────────────
 app = FastAPI()
-twilio_client = Client(TWILIO_SID, TWILIO_TOKEN)
+twilio = Client(TWILIO_SID, TWILIO_TOKEN)
 
 # ── CORS ───────────────────────────────────────────────────────────────────
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "https://assistant.emeghara.tech",
-        "https://www.emeghara.tech"
-    ],
+    allow_origins=["https://www.emeghara.tech"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# ── API-KEY VERIFICATION ───────────────────────────────────────────────────
+# ── API KEY VERIFICATION ───────────────────────────────────────────────────
 @app.middleware("http")
 async def verify_api_key(request: Request, call_next):
-    # allow these public endpoints
-    if request.url.path in ("/health", "/incoming", "/handle-lead"):
+    if request.url.path in ("/health", "/twiml", "/incoming", "/stream"):
         return await call_next(request)
-
     key = request.headers.get("x-api-key")
     if key != API_KEY:
         return JSONResponse({"detail": "Invalid API Key"}, status_code=401)
-
     return await call_next(request)
 
-# ── STATIC UI (OPTIONAL) ──────────────────────────────────────────────────
-app.mount(
-    "/",
-    StaticFiles(directory="public_html/assistant", html=True),
-    name="static",
-)
+# ── MODELS ─────────────────────────────────────────────────────────────────
+class CallStart(BaseModel):
+    to: str
+    from_: str | None = Field(None, alias="from")
 
-# ── HEALTH CHECK ───────────────────────────────────────────────────────────
+class CallStop(BaseModel):
+    callConnectionId: str
+
+# ── IN-MEMORY STORE ─────────────────────────────────────────────────────────
+TRANSCRIPTS: dict[str, list[str]] = {}
+
+# ── HEALTH CHECK ────────────────────────────────────────────────────────────
 @app.get("/health")
 async def health():
     return {"status": "ok"}
 
-# ── OUTBOUND CALLS FOR “CALL ME” BUTTON ────────────────────────────────────
-from pydantic import BaseModel, Field
-
-class CallStartPayload(BaseModel):
-    to: str
-    from_: str | None = Field(None, alias="from")
-
-class CallStopPayload(BaseModel):
-    callConnectionId: str
-
+# ── START A CALL ───────────────────────────────────────────────────────────
 @app.post("/call/start")
-async def start_call(payload: CallStartPayload):
+async def start_call(payload: CallStart):
     to_number   = payload.to
     from_number = payload.from_ or FROM_NUMBER
 
     try:
-        call = twilio_client.calls.create(
+        call = twilio.calls.create(
             to=to_number,
             from_=from_number,
             url=f"{API_BASE}/incoming"
         )
+        # initialize transcript list
+        TRANSCRIPTS[call.sid] = []
         return {"callConnectionId": call.sid}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+# ── STOP A CALL ────────────────────────────────────────────────────────────
 @app.post("/call/stop")
-async def stop_call(payload: CallStopPayload):
+async def stop_call(payload: CallStop):
     try:
-        twilio_client.calls(payload.callConnectionId).update(status="completed")
+        twilio.calls(payload.callConnectionId).update(status="completed")
         return {"status": "completed"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-# ── INCOMING WEBHOOK: GATHER THE LEAD’S NAME ───────────────────────────────
+# ── TRANSCRIPT ROUTE ───────────────────────────────────────────────────────
+@app.get("/call/transcript")
+async def get_transcript(callConnectionId: str):
+    lines = TRANSCRIPTS.get(callConnectionId, [])
+    return {"transcript": lines}
+
+# ── INCOMING CALL TWIML ─────────────────────────────────────────────────────
 @app.post("/incoming")
 async def incoming():
-    # ask caller to say their name, then press #
-    resp = VoiceResponse()
-    gather = Gather(input="speech", action="/handle-lead", method="POST", finishOnKey="#")
-    gather.say("Hello! Please say your name after the tone, then press the pound key.")
-    resp.append(gather)
-    # if they never respond, hang up
-    resp.say("We didn't receive any input. Goodbye.")
-    resp.hangup()
-    return Response(content=str(resp), media_type="text/xml")
+    # start Twilio MediaStreams on connect
+    xml = f"""
+<Response>
+  <Start>
+    <Stream url="{API_BASE.replace('https','wss')}/stream"/>
+  </Start>
+  <!-- silence until your WebSocket kicks in -->
+  <Pause length="60"/>
+  <Hangup/>
+</Response>
+"""
+    return Response(content=xml, media_type="text/xml")
 
-# ── HANDLE-LEAD: SEND EMAIL & HANG UP ──────────────────────────────────────
-@app.post("/handle-lead")
-async def handle_lead(speechResult: str = Form(...), From: str = Form(...)):
-    # speechResult → the name they spoke
-    # From → the caller’s phone number
-    try:
-        msg = MIMEText(f"""
-        <p><strong>Name:</strong> {speechResult}</p>
-        <p><strong>Phone:</strong> {From}</p>
-        """, "html")
-        msg["Subject"] = "New Lead from Call-Center AI"
-        msg["From"]    = SMTP_USER
-        msg["To"]      = LEADS_TO
+# ── WEBSOCKET FOR MEDIASTREAM ───────────────────────────────────────────────
+@app.websocket("/stream")
+async def media_stream(ws: WebSocket):
+    # query string may carry CallSid
+    call_sid = ws.query_params.get("callSid", "")
+    await ws.accept()
 
-        with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as smtp:
-            smtp.starttls()
-            smtp.login(SMTP_USER, SMTP_PASS)
-            smtp.sendmail(SMTP_USER, LEADS_TO.split(","), msg.as_string())
+    # send an initial greeting via TTS
+    greeting = "Hello! Thanks for calling our AI call center. How can I help you today?"
+    greeting_pcm = await tts_synthesize(greeting)
+    await ws.send_json({"event":"media","media":{"payload":base64.b64encode(greeting_pcm).decode()}})
 
-    except Exception as e:
-        # on error, tell them and hang up
-        resp = VoiceResponse()
-        resp.say("Sorry, we encountered an error saving your lead. Goodbye.")
-        resp.hangup()
-        return Response(content=str(resp), media_type="text/xml")
+    # loop over incoming audio events
+    async for msg in ws.iter_json():
+        if msg.get("event") != "media":
+            continue
 
-    # success: thank them
-    resp = VoiceResponse()
-    resp.say("Thank you! Your information has been received. Goodbye.")
-    resp.hangup()
-    return Response(content=str(resp), media_type="text/xml")
+        # decode and transcribe
+        pcm_chunk = base64.b64decode(msg["media"]["payload"])
+        user_text = await stt_recognize(pcm_chunk)
+        if not user_text.strip():
+            continue
+
+        # store the line
+        TRANSCRIPTS.setdefault(call_sid, []).append("User: " + user_text)
+
+        # call GPT for a response
+        resp = await openai.ChatCompletion.acreate(
+            model="gpt-4o-audio-preview",
+            messages=[
+                {"role":"system","content":"You are a helpful phone receptionist."},
+                *[
+                  {"role":"user","content":ln}
+                  for ln in TRANSCRIPTS[call_sid] if ln.startswith("User:")
+                ]
+            ]
+        )
+        reply_text = resp.choices[0].message.content
+        TRANSCRIPTS[call_sid].append("AI: " + reply_text)
+
+        # synthesize TTS & send back
+        reply_pcm = await tts_synthesize(reply_text)
+        await ws.send_json({
+            "event":"media",
+            "media":{"payload":base64.b64encode(reply_pcm).decode()}
+        })
+
+    await ws.close()
