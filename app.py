@@ -4,6 +4,7 @@ import os
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response, JSONResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from twilio.rest import Client
 
@@ -22,9 +23,13 @@ app = FastAPI()
 twilio_client = Client(TWILIO_SID, TWILIO_TOKEN)
 
 # ── CORS ───────────────────────────────────────────────────────────────────
+# allow both your API domain and your UI domain
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["https://www.emeghara.tech"],  # or ["*"] for testing
+    allow_origins=[
+        "https://assistant.emeghara.tech",
+        "https://www.emeghara.tech"
+    ],
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -32,7 +37,7 @@ app.add_middleware(
 # ── API-KEY VERIFICATION ───────────────────────────────────────────────────
 @app.middleware("http")
 async def verify_api_key(request: Request, call_next):
-    # allow health and TwiML endpoints without API key
+    # skip auth on health and twiml
     if request.url.path in ("/health", "/twiml"):
         return await call_next(request)
 
@@ -92,8 +97,8 @@ async def twiml():
 """
     return Response(content=xml, media_type="text/xml")
 
-# ── (OPTIONAL) SERVE STATIC UI ──────────────────────────────────────────────
-from fastapi.staticfiles import StaticFiles
+# ── SERVE YOUR STATIC UI ────────────────────────────────────────────────────
+# assumes your HTML/CSS/JS is in public_html/assistant/index.html
 app.mount(
     "/", 
     StaticFiles(directory="public_html/assistant", html=True),
