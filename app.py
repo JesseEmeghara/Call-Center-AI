@@ -4,16 +4,15 @@ import os
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response, JSONResponse
-from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from twilio.rest import Client
 
 # ── CONFIG ────────────────────────────────────────────────────────────────
-TWILIO_SID   = os.getenv("TWILIO_ACCOUNT_SID")
-TWILIO_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
-API_KEY      = os.getenv("API_KEY")
-FROM_NUMBER  = os.getenv("FROM_NUMBER")   # e.g. "+18338790587"
-API_BASE     = os.getenv("API_BASE")      # e.g. "https://assistant.emeghara.tech"
+TWILIO_SID      = os.getenv("TWILIO_ACCOUNT_SID")
+TWILIO_TOKEN    = os.getenv("TWILIO_AUTH_TOKEN")
+API_KEY         = os.getenv("API_KEY")
+FROM_NUMBER     = os.getenv("FROM_NUMBER")   # e.g. "+18338790587"
+API_BASE        = os.getenv("API_BASE")      # e.g. "https://assistant.emeghara.tech"
 
 if not all([TWILIO_SID, TWILIO_TOKEN, API_KEY, FROM_NUMBER, API_BASE]):
     raise RuntimeError("One or more required env vars missing")
@@ -23,12 +22,11 @@ app = FastAPI()
 twilio_client = Client(TWILIO_SID, TWILIO_TOKEN)
 
 # ── CORS ───────────────────────────────────────────────────────────────────
-# allow both your API domain and your UI domain
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
-        "https://assistant.emeghara.tech",
-        "https://www.emeghara.tech"
+        "https://assistant.emeghara.tech",  # Railway‐hosted API
+        "https://www.emeghara.tech"         # Your Hostinger UI
     ],
     allow_methods=["*"],
     allow_headers=["*"],
@@ -37,7 +35,7 @@ app.add_middleware(
 # ── API-KEY VERIFICATION ───────────────────────────────────────────────────
 @app.middleware("http")
 async def verify_api_key(request: Request, call_next):
-    # skip auth on health and twiml
+    # allow health and TwiML endpoints without an API key
     if request.url.path in ("/health", "/twiml"):
         return await call_next(request)
 
@@ -47,7 +45,7 @@ async def verify_api_key(request: Request, call_next):
 
     return await call_next(request)
 
-# ── MODELS ─────────────────────────────────────────────────────────────────
+# ── PAYLOAD MODELS ─────────────────────────────────────────────────────────
 class CallStartPayload(BaseModel):
     to: str
     from_: str | None = Field(None, alias="from")
@@ -96,11 +94,3 @@ async def twiml():
 </Response>
 """
     return Response(content=xml, media_type="text/xml")
-
-# ── SERVE YOUR STATIC UI ────────────────────────────────────────────────────
-# assumes your HTML/CSS/JS is in public_html/assistant/index.html
-app.mount(
-    "/", 
-    StaticFiles(directory="public_html/assistant", html=True),
-    name="static",
-)
