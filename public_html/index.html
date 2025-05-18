@@ -1,0 +1,102 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Call-Center AI</title>
+  <style>
+    body { font-family: sans-serif; max-width: 600px; margin: auto; padding: 1rem; }
+    input, button { font-size: 1rem; padding: .5rem; margin: .5rem 0; }
+    #transcript { white-space: pre-wrap; border: 1px solid #ccc; padding: .5rem; min-height: 8em; }
+  </style>
+</head>
+<body>
+  <h1>Call-Center AI</h1>
+
+  <label for="phone">Number to call:</label><br/>
+  <input id="phone" type="tel" placeholder="+15551234567" /><br/>
+
+  <button id="startCall">Start Call</button>
+  <button id="endCall" disabled>Hang Up</button>
+
+  <h2>Status</h2>
+  <pre id="status">idle</pre>
+
+  <h2>Transcript</h2>
+  <div id="transcript"></div>
+
+  <script>
+    // ── CONFIG ─────────────────────────────────────────────────────────────
+    const API_BASE = "https://assistant.emeghara.tech";
+    const API_KEY  = "fH3k8JmW2qZdYt9pLsX1R7uEnVbQ4aCg";    // ← your Railway API_KEY value
+    const FROM     = "+1YOUR_ACS_PHONE_NUMBER";         // ← fill in once you have your ACS number
+
+    // ── STATE ──────────────────────────────────────────────────────────────
+    let callConnectionId = null;
+
+    // ── HELPERS ────────────────────────────────────────────────────────────
+    function setStatus(msg) {
+      document.getElementById("status").textContent = msg;
+    }
+    async function api(path, opts = {}) {
+      opts.headers = Object.assign({
+        "Content-Type": "application/json",
+        "x-api-key":    API_KEY
+      }, opts.headers || {});
+      opts.mode = "cors";
+      const res = await fetch(API_BASE + path, opts);
+      if (!res.ok) throw new Error(await res.text());
+      return res.json();
+    }
+
+    // ── UI HOOKS ───────────────────────────────────────────────────────────
+    document.getElementById("startCall").addEventListener("click", async () => {
+      const to = document.getElementById("phone").value.trim();
+      if (!to) return alert("Please enter a number");
+      setStatus("Dialing " + to + "...");
+      try {
+        const { callConnectionId: id } = await api("/call/start", {
+          method: "POST",
+          body: JSON.stringify({ to, from: FROM })
+        });
+        callConnectionId = id;
+        setStatus("Call started: " + id);
+        document.getElementById("startCall").disabled = true;
+        document.getElementById("endCall").disabled   = false;
+        pollTranscript();
+      } catch (e) {
+        setStatus("✖ " + e.message);
+      }
+    });
+
+    document.getElementById("endCall").addEventListener("click", async () => {
+      setStatus("Hanging up…");
+      try {
+        await api("/call/stop", {
+          method: "POST",
+          body: JSON.stringify({ callConnectionId })
+        });
+        setStatus("Call ended.");
+      } catch (e) {
+        setStatus("✖ " + e.message);
+      }
+      document.getElementById("startCall").disabled = false;
+      document.getElementById("endCall").disabled   = true;
+      callConnectionId = null;
+    });
+
+    // ── POLLING ────────────────────────────────────────────────────────────
+    async function pollTranscript() {
+      if (!callConnectionId) return;
+      try {
+        const { transcript } = await api(
+          `/call/transcript?callConnectionId=${encodeURIComponent(callConnectionId)}`
+        );
+        document.getElementById("transcript").textContent = transcript.join("\n");
+      } catch (e) {
+        console.error("Transcript fetch error:", e);
+      }
+      setTimeout(pollTranscript, 2000);
+    }
+  </script>
+</body>
+</html>
