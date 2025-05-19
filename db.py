@@ -1,26 +1,33 @@
 # db.py
 
-from sqlalchemy import create_engine
+import os
+import datetime
+from sqlalchemy import create_engine, Column, String, Text, DateTime
 from sqlalchemy.orm import declarative_base, Session
-import os, datetime
 
-Base = declarative_base()
+# ── CONFIG ─────────────────────────────────────────────────────────────────
+DB_URL = os.getenv("MYSQL_URL")
+if not DB_URL:
+    raise RuntimeError("MYSQL_URL is not set!")
 
-def init_db(db_url=None):
-    url = db_url or os.getenv("MYSQL_URL")
-    if not url:
-        raise RuntimeError("MYSQL_URL is not set!")
-    engine = create_engine(url, echo=False, future=True)
-    # import your model classes here so SQLAlchemy picks them up:
-    from .models import Lead   # wherever your Lead model lives
-    Base.metadata.create_all(engine)
-    # store engine on module for save_lead to use
-    globals()["_engine"] = engine
+# ── SQLAlchemy SETUP ─────────────────────────────────────────────────────────
+Base   = declarative_base()
+_engine = create_engine(DB_URL, echo=False, future=True)
 
-def get_session():
-    return Session(globals()["_engine"])
+class Lead(Base):
+    __tablename__ = "leads"
+    phone      = Column(String(32), primary_key=True)
+    name       = Column(String(128), nullable=False)
+    email      = Column(String(256), nullable=False)
+    notes      = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow)
 
-def save_lead(name, email, phone, notes=""):
-    with get_session() as sess:
+def init_db():
+    """Create the leads table if it doesn't exist."""
+    Base.metadata.create_all(_engine)
+
+def save_lead(name: str, email: str, phone: str, notes: str = ""):
+    """Add a new Lead row to the database."""
+    with Session(_engine) as sess:
         sess.add(Lead(name=name, email=email, phone=phone, notes=notes))
         sess.commit()
