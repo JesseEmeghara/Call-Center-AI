@@ -1,42 +1,43 @@
 # app.py
 
 import os
+import datetime
 from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response, JSONResponse
 from pydantic import BaseModel, Field
 from twilio.rest import Client
 
-# ── IMPORT DB & INIT ───────────────────────────────────────────────────────
-from db import init_db, save_lead
-
 # ── CONFIG ────────────────────────────────────────────────────────────────
-TWILIO_SID   = os.getenv("TWILIO_ACCOUNT_SID")
-TWILIO_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
-API_KEY      = os.getenv("API_KEY")
-FROM_NUMBER  = os.getenv("FROM_NUMBER")
-API_BASE     = os.getenv("API_BASE")
-HOSTNAME     = os.getenv("HOSTNAME")
+TWILIO_SID      = os.getenv("TWILIO_ACCOUNT_SID")
+TWILIO_TOKEN    = os.getenv("TWILIO_AUTH_TOKEN")
+API_KEY         = os.getenv("API_KEY")
+FROM_NUMBER     = os.getenv("FROM_NUMBER")
+API_BASE        = os.getenv("API_BASE")
+HOSTNAME        = os.getenv("HOSTNAME")
+MYSQL_URL       = os.getenv("MYSQL_URL")
 
-if not all([TWILIO_SID, TWILIO_TOKEN, API_KEY, FROM_NUMBER, API_BASE, HOSTNAME]):
+if not all([TWILIO_SID, TWILIO_TOKEN, API_KEY, FROM_NUMBER, API_BASE, HOSTNAME, MYSQL_URL]):
     raise RuntimeError("One or more required env vars missing")
+
+# ── DATABASE INIT ─────────────────────────────────────────────────────────
+from db import init_db  # your db.py
+init_db(MYSQL_URL)
 
 # ── APP & CLIENT SETUP ─────────────────────────────────────────────────────
 app = FastAPI()
 twilio = Client(TWILIO_SID, TWILIO_TOKEN)
 
-# ── INITIALIZE DATABASE ────────────────────────────────────────────────────
-@app.on_event("startup")
-def on_startup():
-    init_db()
-
 # ── CORS ───────────────────────────────────────────────────────────────────
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
-      "https://www.emeghara.tech",
-      "https://assistant.emeghara.tech",
+        "https://emeghara.tech",
+        "https://www.emeghara.tech",
+        "https://assistant.emeghara.tech",
+        "*"                      # wildcard for testing; remove in production
     ],
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -44,21 +45,21 @@ app.add_middleware(
 # ── API-KEY VERIFICATION ───────────────────────────────────────────────────
 @app.middleware("http")
 async def verify_api_key(request: Request, call_next):
-    # 1) Always let CORS preflights through
+    # Let all CORS preflight through
     if request.method == "OPTIONS":
         return await call_next(request)
 
-    # 2) Skip auth on public/Twilio callbacks
+    # Skip auth on public endpoints
     if request.url.path in ("/health", "/incoming", "/twiml", "/stream"):
         return await call_next(request)
 
-    # 3) Otherwise require the x-api-key header
+    # Enforce x-api-key on everything else
     if request.headers.get("x-api-key") != API_KEY:
         return JSONResponse({"detail": "Invalid API Key"}, status_code=401)
 
     return await call_next(request)
 
-# ── MODELS ─────────────────────────────────────────────────────────────────
+# ── PAYLOAD MODELS ─────────────────────────────────────────────────────────
 class StartPayload(BaseModel):
     to: str
     from_: str | None = Field(None, alias="from")
@@ -66,7 +67,7 @@ class StartPayload(BaseModel):
 class StopPayload(BaseModel):
     callConnectionId: str
 
-# ── HEALTH CHECK ────────────────────────────────────────────────────────────
+# ── HEALTH CHECK ───────────────────────────────────────────────────────────
 @app.get("/health")
 async def health():
     return {"status": "ok"}
@@ -95,7 +96,7 @@ async def stop_call(payload: StopPayload):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-# ── INCOMING CALL (TwiML) ──────────────────────────────────────────────────
+# ── TWIML INCOMING WEBHOOK ─────────────────────────────────────────────────
 @app.post("/incoming")
 async def incoming():
     twiml = f"""
@@ -108,14 +109,15 @@ async def incoming():
 </Response>"""
     return Response(content=twiml, media_type="text/xml")
 
-# ── MEDIA STREAMING WS ──────────────────────────────────────────────────────
+# ── MEDIA STREAMING SOCKET ─────────────────────────────────────────────────
 @app.websocket("/stream")
 async def stream(ws: WebSocket):
     await ws.accept()
     try:
         while True:
             frame = await ws.receive_text()
-            # echo back (or process & call save_lead() once you've parsed the call)
+            # here you’d decode Twilio’s media frames, send them to OpenAI, etc.
+            # For now we just echo it back:
             await ws.send_text(frame)
     except WebSocketDisconnect:
         pass
